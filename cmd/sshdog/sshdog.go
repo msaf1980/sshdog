@@ -16,24 +16,15 @@
 package main
 
 import (
-	"fmt"
-	"github.com/GeertJohan/go.rice"
-	"github.com/matir/sshdog/daemon"
 	"os"
 	"strconv"
 	"strings"
+
+	rice "github.com/GeertJohan/go.rice"
+	"github.com/msaf1980/sshdog"
+	"github.com/msaf1980/sshdog/daemon"
+	"github.com/msaf1980/sshdog/dbg"
 )
-
-type Debugger bool
-
-func (d Debugger) Debug(format string, args ...interface{}) {
-	if d {
-		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", msg)
-	}
-}
-
-var dbg Debugger = true
 
 // Lookup the port number
 func getPort(box *rice.Box) int16 {
@@ -77,7 +68,7 @@ func main() {
 	mainBox = mustFindBox()
 
 	if beQuiet(mainBox) {
-		dbg = false
+		dbg.Set(false)
 	}
 
 	if shouldDaemonize(mainBox) {
@@ -111,10 +102,10 @@ func mustFindBox() *rice.Box {
 
 // Actually run the implementation of the daemon
 func daemonStart() (waitFunc func(), stopFunc func()) {
-	server := NewServer()
+	server := sshdog.NewServer()
 
 	hasHostKeys := false
-	for _, keyName := range keyNames {
+	for _, keyName := range sshdog.KeyNames {
 		if keyData, err := mainBox.Bytes(keyName); err == nil {
 			dbg.Debug("Adding hostkey file: %s", keyName)
 			if err = server.AddHostkey(keyData); err != nil {
