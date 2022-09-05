@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+jobs:
+
+  tests:
+    name: Test code
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go:
+          - ^1.15
+          - ^1.16
+          - ^1.17
+          - ^1.18
+          - ^1.19
+          - ^1
+    steps:
+
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: ${{ matrix.go }}
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 200
+
+    - name: Run tests
+      run: |
+        go build ./cmd/sshdog
+        go build ./cmd/scpdebug
+        go test ./sshtest
