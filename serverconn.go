@@ -16,6 +16,7 @@
 package sshdog
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +25,8 @@ import (
 	"os/user"
 	"runtime"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/google/shlex"
 	"github.com/matir/sshdog/dbg"
@@ -40,6 +43,8 @@ type ServerConn struct {
 	chans      <-chan ssh.NewChannel
 	environ    []string
 	exitStatus uint32
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func NewServerConn(conn net.Conn, s *Server) (*ServerConn, error) {
@@ -63,6 +68,26 @@ func (conn *ServerConn) ServiceGlobalRequests() {
 			r.Reply(true, []byte{})
 		}
 	}
+}
+
+func (conn *ServerConn) trackConn(add bool) bool {
+	// mu, conns, connWg are inherited from Server
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if add {
+		if conn.shutdown {
+			// shutdown initiate
+			return true
+		}
+		conn.conns[conn] = struct{}{}
+		conn.connWg.Add(1)
+		conn.ctx, conn.cancel = context.WithCancel(context.Background())
+	} else {
+		delete(conn.conns, conn)
+		conn.connWg.Done()
+	}
+	return false
 }
 
 // Handle a single established connection
@@ -155,15 +180,13 @@ func (conn *ServerConn) HandleSessionChannel(wg *sync.WaitGroup, newChan ssh.New
 		ch.Close()
 	}()
 
-	var success bool
 	for req := range reqs {
+		var success bool
 		switch req.Type {
 		case "pty-req":
 			ptyreq := &PTYRequest{}
-			success = true
 			if err := ssh.Unmarshal(req.Payload, ptyreq); err != nil {
 				dbg.Debug("Error unmarshaling pty-req: %v", err)
-				success = false
 			}
 			conn.pty, err = pty.OpenPty()
 			if conn.pty != nil {
@@ -171,71 +194,65 @@ func (conn *ServerConn) HandleSessionChannel(wg *sync.WaitGroup, newChan ssh.New
 				os.Setenv("TERM", ptyreq.Term)
 				// TODO: set pty modes
 			}
-			if err != nil {
+			if err == nil {
+				success = true
+			} else {
 				dbg.Debug("Failed allocating pty: %v", err)
-				success = false
-			}
-			if req.WantReply {
-				req.Reply(success, []byte{})
 			}
 		case "env":
 			envreq := &EnvRequest{}
 			if err := ssh.Unmarshal(req.Payload, envreq); err != nil {
 				dbg.Debug("Error unmarshaling env: %v", err)
-				success = false
 			} else {
 				dbg.Debug("env: %s=%s", envreq.Name, envreq.Value)
 				conn.environ = append(conn.environ, fmt.Sprintf("%s=%s", envreq.Name, envreq.Value))
 				success = true
 			}
-			if req.WantReply {
-				req.Reply(success, []byte{})
-			}
 		case "shell":
 			// TODO: get the user's shell
-			conn.ExecuteForChannel(defaultShell(), ch)
-			if req.WantReply {
-				req.Reply(true, []byte{})
-			}
-			return
+			success = conn.ExecuteForChannel(defaultShell(), ch)
 		case "exec":
 			execReq := &ExecRequest{}
 			if err := ssh.Unmarshal(req.Payload, execReq); err != nil {
 				dbg.Debug("Error unmarshaling exec: %v", err)
-				success = false
 			} else {
 				if cmd, err := shlex.Split(execReq.Cmd); err == nil {
 					dbg.Debug("Command: %v", cmd)
-					if req.WantReply {
-						req.Reply(true, []byte{})
-					}
-					if cmd[0] == "scp" {
+					if len(cmd) == 0 {
+						// start a shell
+						success = conn.ExecuteForChannel(defaultShell(), ch)
+					} else if cmd[0] == "scp" {
 						if err := conn.SCPHandler(cmd, ch); err != nil {
 							dbg.Debug("scp failure: %v", err)
 							conn.exitStatus = 1
 						}
 					} else {
-						conn.ExecuteForChannel(commandWithShell(execReq.Cmd), ch)
+						success = conn.ExecuteForChannel(commandWithShell(execReq.Cmd), ch)
 					}
 				} else {
 					dbg.Debug("Error splitting cmd: %v", err)
-					if req.WantReply {
-						req.Reply(false, []byte{})
-					}
 				}
 			}
 			return
 		default:
 			dbg.Debug("Unknown session request: %s", req.Type)
-			if req.WantReply {
-				req.Reply(false, []byte{})
-			}
+		}
+		if req.WantReply {
+			req.Reply(success, []byte{})
 		}
 	}
 }
 
+type exitStatusMsg struct {
+	Status uint32
+}
+
 // Execute a process for the channel.
-func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
+func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) bool {
+	if conn.trackConn(true) {
+		dbg.Debug("Shutdown init, canceled executing %v", shellCmd)
+		return false
+	}
 	dbg.Debug("Executing %v", shellCmd)
 	proc := exec.Command(shellCmd[0], shellCmd[1:]...)
 	proc.Env = conn.environ
@@ -251,8 +268,41 @@ func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
 		conn.pty.AttachPty(proc)
 		conn.pty.AttachIO(ch, ch)
 	}
-	proc.Run()
-	dbg.Debug("Finished execution.")
+
+	waitDone := make(chan struct{})
+	go func() {
+		select {
+		case <-conn.ctx.Done():
+			proc.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-time.After(time.Second):
+				proc.Process.Kill()
+			case <-waitDone:
+			}
+		case <-waitDone:
+		}
+	}()
+	err := proc.Run()
+	close(waitDone)
+	conn.trackConn(false)
+	if err == nil {
+		dbg.Debug("Finished execution.")
+	} else {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			conn.exitStatus = uint32(exitErr.ExitCode())
+		} else {
+			conn.exitStatus = 127
+		}
+		dbg.Debug("Finished execution with code %d, error: %v", conn.exitStatus, err)
+	}
+	return true
+}
+
+func (conn *ServerConn) Cancel() {
+	if conn.cancel != nil {
+		conn.cancel()
+		conn.cancel = nil
+	}
 }
 
 // Message for port forwarding

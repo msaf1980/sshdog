@@ -18,10 +18,15 @@ package sshdog
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"fmt"
+	"errors"
 	"io"
+	"io/ioutil"
 	"net"
+	"os"
+	"path"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/matir/sshdog/dbg"
 	"golang.org/x/crypto/ssh"
@@ -32,32 +37,69 @@ type Server struct {
 	ServerConfig   ssh.ServerConfig
 	Socket         net.Listener
 	AuthorizedKeys map[string]bool
+	keyDir         string // used only for per-user auth keys only
+	PasswordMap    map[string]string
 	stop           chan bool
 	done           chan bool
+	mu             sync.RWMutex
+	shutdown       bool
+	conns          map[*ServerConn]struct{}
+	connWg         sync.WaitGroup
 }
 
-var KeyNames = []string{
-	"ssh_host_dsa_key",
-	"ssh_host_ecdsa_key",
-	"ssh_host_rsa_key",
-}
+var (
+	KeyNames = []string{
+		"ssh_host_dsa_key",
+		"ssh_host_ecdsa_key",
+		"ssh_host_rsa_key",
+	}
+	ErrWrongPassword       = errors.New("Wrong password")
+	ErrDisablePasswordAuth = errors.New("Password auth are diabled")
+	ErrUnknownPubKey       = errors.New("No valid key found.")
+)
 
+// NewServer create new server instance with global authorized keys (load before start with AddAuthorizedKeys)
 func NewServer() *Server {
-	s := &Server{}
-	s.AuthorizedKeys = make(map[string]bool)
+	s := &Server{
+		stop:           make(chan bool),
+		done:           make(chan bool, 1),
+		conns:          make(map[*ServerConn]struct{}),
+		AuthorizedKeys: make(map[string]bool),
+		PasswordMap:    make(map[string]string),
+	}
+
 	s.ServerConfig.PublicKeyCallback = s.VerifyPublicKey
-	s.stop = make(chan bool)
-	s.done = make(chan bool, 1)
+	s.ServerConfig.PasswordCallback = s.VerifyPassword
+
 	return s
 }
 
-func (s *Server) listen(port int16) error {
-	sPort := ":" + strconv.Itoa(int(port))
-	if sock, err := net.Listen("tcp", sPort); err != nil {
+// NewServer create new server instance with per-user authorized keys (stored in keyDir)
+func NewServerPerUser(keyDir string) (*Server, error) {
+	if keyDir == "" {
+		return nil, errors.New("key dir empty")
+	}
+	s := &Server{
+		keyDir:         keyDir,
+		stop:           make(chan bool),
+		done:           make(chan bool, 1),
+		conns:          make(map[*ServerConn]struct{}),
+		AuthorizedKeys: make(map[string]bool),
+		PasswordMap:    make(map[string]string),
+	}
+
+	s.ServerConfig.PublicKeyCallback = s.VerifyUserPublicKey
+	s.ServerConfig.PasswordCallback = s.VerifyPassword
+
+	return s, nil
+}
+
+func (s *Server) listen(addr string) error {
+	if sock, err := net.Listen("tcp", addr); err != nil {
 		dbg.Debug("Unable to listen: %v", err)
 		return err
 	} else {
-		dbg.Debug("Listening on %s", sPort)
+		dbg.Debug("Listening on %s", addr)
 		s.Socket = sock
 	}
 	return nil
@@ -118,11 +160,19 @@ func (s *Server) serveLoop() error {
 			return nil
 		}
 	}
-	return nil
 }
 
 func (s *Server) ListenAndServe(port int16) (error, func()) {
-	if err := s.listen(port); err != nil {
+	addr := ":" + strconv.Itoa(int(port))
+	if err := s.listen(addr); err != nil {
+		return err, nil
+	}
+	go s.serveLoop()
+	return nil, s.Stop
+}
+
+func (s *Server) ListenAndServe2(addr string) (error, func()) {
+	if err := s.listen(addr); err != nil {
 		return err, nil
 	}
 	go s.serveLoop()
@@ -137,20 +187,60 @@ func (s *Server) ListenAndServeForever(port int16) error {
 	return nil
 }
 
+func (s *Server) ListenAndServeForever2(addr string) error {
+	if err, _ := s.ListenAndServe2(addr); err != nil {
+		return err
+	}
+	s.Wait()
+	return nil
+}
+
+func (s *Server) Address() string {
+	if s.Socket == nil {
+		return ""
+	}
+	return s.Socket.Addr().String()
+}
+
+func (s *Server) HostAndPort() (string, string) {
+	addr := s.Address()
+	p := strings.LastIndexByte(addr, ':')
+	if p < 0 {
+		return "", ""
+	}
+	return addr[:p], addr[p+1:]
+}
+
 // Wait for server shutdown
 func (s *Server) Wait() {
 	dbg.Debug("Waiting for shutdown.")
 	<-s.done
 }
 
+func (s *Server) GetDoneChan() chan bool {
+	return s.done
+}
+
 // Ask for shutdown
 func (s *Server) Stop() {
 	dbg.Debug("requesting shutdown.")
+	s.mu.Lock()
+	s.shutdown = true
+	for conn := range s.conns {
+		if conn.cancel != nil {
+			conn.cancel()
+		}
+	}
+	s.mu.Unlock()
 	s.stop <- true
 	close(s.stop)
 }
 
-func (s *Server) AddAuthorizedKeys(keyData []byte) {
+func (s *Server) AddAuthorizedKeys(keyData []byte) *Server {
+	if s.keyDir == "" {
+		dbg.Debug("skip, per-user authorized keys enabled")
+		return s
+	}
 	for len(keyData) > 0 {
 		newKey, _, _, left, err := ssh.ParseAuthorizedKey(keyData)
 		keyData = left
@@ -160,15 +250,82 @@ func (s *Server) AddAuthorizedKeys(keyData []byte) {
 		}
 		s.AuthorizedKeys[string(newKey.Marshal())] = true
 	}
+	return s
+}
+
+func (s *Server) AddUser(user, password string) *Server {
+	if user == "" || password == "" {
+		dbg.Debug("Empty username or password")
+	} else {
+		s.PasswordMap[user] = password
+	}
+	return s
 }
 
 func (s *Server) VerifyPublicKey(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	keyStr := string(key.Marshal())
-	if _, ok := s.AuthorizedKeys[keyStr]; !ok {
+	if _, ok := s.AuthorizedKeys[string(key.Marshal())]; !ok {
 		dbg.Debug("Key not found!")
-		return nil, fmt.Errorf("No valid key found.")
+		return nil, ErrUnknownPubKey
 	}
-	return &ssh.Permissions{}, nil
+	return &ssh.Permissions{
+		// Record the public key used for authentication.
+		Extensions: map[string]string{
+			"pubkey-fp": ssh.FingerprintSHA256(key),
+		},
+	}, nil
+}
+
+func (s *Server) readUserAuthKeys(u string) (map[string]bool, error) {
+	keysPath := path.Join(s.keyDir, u)
+	keyData, err := os.ReadFile(keysPath)
+	if err != nil {
+		dbg.Debug("Failed to load authorized_keys %s, err: %v", keysPath, err)
+		return nil, ErrUnknownPubKey
+	}
+
+	authorizedKeys := make(map[string]bool)
+	for len(keyData) > 0 {
+		newKey, _, _, left, err := ssh.ParseAuthorizedKey(keyData)
+		keyData = left
+		if err != nil {
+			dbg.Debug("Error parsing key: %v", err)
+			break
+		}
+		authorizedKeys[string(newKey.Marshal())] = true
+	}
+	return authorizedKeys, nil
+}
+
+func (s *Server) VerifyUserPublicKey(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	authorizedKeys, err := s.readUserAuthKeys(conn.User())
+	if err != nil {
+		return nil, err
+	}
+	if _, exist := authorizedKeys[string(key.Marshal())]; exist {
+		return &ssh.Permissions{
+			// Record the public key used for authentication.
+			Extensions: map[string]string{
+				"pubkey-fp": ssh.FingerprintSHA256(key),
+			},
+		}, nil
+	}
+	return nil, ErrUnknownPubKey
+}
+
+func (s *Server) VerifyPassword(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+	if len(s.PasswordMap) == 0 {
+		return nil, ErrDisablePasswordAuth
+	}
+	user := conn.User()
+	if password, exist := s.PasswordMap[user]; exist {
+		if string(pass) == password {
+			return nil, nil
+		} else {
+			return nil, ErrWrongPassword
+		}
+	} else {
+		return nil, errors.New(user + " not exist")
+	}
 }
 
 func (s *Server) AddHostkey(keyData []byte) error {
@@ -178,6 +335,14 @@ func (s *Server) AddHostkey(keyData []byte) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) AddHostkeyFrom(keypath string) error {
+	buf, err := ioutil.ReadFile(keypath)
+	if err != nil {
+		return err
+	}
+	return s.AddHostkey(buf)
 }
 
 func (s *Server) RandomHostkey() error {

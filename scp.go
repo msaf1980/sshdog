@@ -56,6 +56,7 @@ var (
 	ErrInvalidPieces  = errors.New("Invalid number of command pieces.")
 	ErrNotRegularFile = errors.New("Not a regular file.")
 	ErrNotDirectory   = errors.New("Not a directory.")
+	ErrNullByte       = errors.New("Expected null byte for EOF.")
 )
 
 // Manage SCP operations in a built-in fashion
@@ -291,7 +292,6 @@ func (conn *ServerConn) SCPSink(path string, dirMode bool, ch ssh.Channel) error
 		case SCPTime:
 		}
 	}
-	return nil
 }
 
 // receive the single file from the scp stream
@@ -327,7 +327,7 @@ func receiveFile(name string, cmd *SCPCommand, src io.Reader) error {
 		return err
 	}
 	if b[0] != byte(0) {
-		return fmt.Errorf("Expected null byte for EOF.")
+		return ErrNullByte
 	}
 	return nil
 }
@@ -341,7 +341,7 @@ func maybeMakeDir(path string, mode int16) error {
 		return nil
 	} else {
 		if !fi.IsDir() {
-			return fmt.Errorf("Path %s exists, but is not a directory.", path)
+			return errors.New("Path " + path + " exists, but is not a directory.")
 		}
 		return nil
 	}
