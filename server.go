@@ -28,7 +28,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/matir/sshdog/dbg"
+	"github.com/msaf1980/sshdog/dbg"
 	"golang.org/x/crypto/ssh"
 )
 

@@ -1,7 +1,7 @@
 package sshtest
 
 import (
-	"github.com/matir/sshdog"
+	"github.com/msaf1980/sshdog"
 )
 
 // Manage the SSH Server

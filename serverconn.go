@@ -29,8 +29,8 @@ import (
 	"time"
 
 	"github.com/google/shlex"
-	"github.com/matir/sshdog/dbg"
-	"github.com/matir/sshdog/pty"
+	"github.com/msaf1980/sshdog/dbg"
+	"github.com/msaf1980/sshdog/pty"
 	"golang.org/x/crypto/ssh"
 )
 
