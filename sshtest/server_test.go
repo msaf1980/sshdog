@@ -84,7 +84,7 @@ func TestServer_SessionCancel(t *testing.T) {
 		stop()
 	}()
 
-	timeout := time.After(100 * time.Millisecond)
+	timeout := time.After(2 * time.Second)
 	select {
 	case <-timeout:
 		t.Error("timeout")

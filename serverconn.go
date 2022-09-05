@@ -273,6 +273,7 @@ func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) boo
 	go func() {
 		select {
 		case <-conn.ctx.Done():
+			dbg.Debug("Killing session.")
 			proc.Process.Signal(syscall.SIGTERM)
 			select {
 			case <-time.After(time.Second):
