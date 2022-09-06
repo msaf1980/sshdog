@@ -224,7 +224,9 @@ func (s *Server) GetDoneChan() chan bool {
 // Ask for shutdown
 func (s *Server) Stop() {
 	dbg.Debug("requesting shutdown.")
+	s.stop <- true
 	s.mu.Lock()
+	dbg.Debug("Cancel %d sessions.", len(s.conns))
 	s.shutdown = true
 	for conn := range s.conns {
 		if conn.cancel != nil {
@@ -232,7 +234,7 @@ func (s *Server) Stop() {
 		}
 	}
 	s.mu.Unlock()
-	s.stop <- true
+	s.connWg.Wait()
 	close(s.stop)
 	dbg.Debug("shutdown.")
 }
