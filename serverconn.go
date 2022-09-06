@@ -298,6 +298,7 @@ func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
 	}
 	dbg.Debug("Executing %v", shellCmd)
 	proc := exec.Command(shellCmd[0], shellCmd[1:]...)
+	proc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	proc.Env = conn.environ
 	if userInfo, err := user.Current(); err == nil {
 		proc.Dir = userInfo.HomeDir
@@ -317,7 +318,19 @@ func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
 		select {
 		case <-conn.ctx.Done():
 			dbg.Debug("Killing session.")
-			proc.Process.Signal(syscall.SIGTERM)
+
+			switch runtime.GOOS {
+			case "windows":
+				proc.Process.Signal(syscall.SIGTERM)
+			default:
+				pgid, err := syscall.Getpgid(proc.Process.Pid)
+				if err == nil {
+					syscall.Kill(-pgid, 15) // kill process group with SIGTERM
+				} else {
+					proc.Process.Signal(syscall.SIGTERM)
+				}
+			}
+
 			select {
 			case <-time.After(time.Second):
 				proc.Process.Kill()
