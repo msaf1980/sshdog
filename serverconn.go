@@ -13,13 +13,11 @@
 // limitations under the License.
 
 // TODO: High-level file comment.
-package main
+package sshdog
 
 import (
+	"context"
 	"fmt"
-	"github.com/google/shlex"
-	"github.com/matir/sshdog/pty"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"net"
 	"os"
@@ -27,6 +25,13 @@ import (
 	"os/user"
 	"runtime"
 	"sync"
+	"syscall"
+	"time"
+
+	"github.com/google/shlex"
+	"github.com/msaf1980/sshdog/dbg"
+	"github.com/msaf1980/sshdog/pty"
+	"golang.org/x/crypto/ssh"
 )
 
 // Handling for a single incoming connection
@@ -38,6 +43,8 @@ type ServerConn struct {
 	chans      <-chan ssh.NewChannel
 	environ    []string
 	exitStatus uint32
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func NewServerConn(conn net.Conn, s *Server) (*ServerConn, error) {
@@ -60,6 +67,31 @@ func (conn *ServerConn) ServiceGlobalRequests() {
 		if r.WantReply {
 			r.Reply(true, []byte{})
 		}
+	}
+}
+
+func (conn *ServerConn) attachConn() bool {
+	// mu, conns, connWg are inherited from Server
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.shutdown {
+		// shutdown initiate
+		return false
+	}
+	conn.conns[conn] = struct{}{}
+	conn.connWg.Add(1)
+	conn.ctx, conn.cancel = context.WithCancel(context.Background())
+	return true
+}
+
+func (conn *ServerConn) detachConn() {
+	// mu, conns, connWg are inherited from Server
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	if _, exist := conn.conns[conn]; exist {
+		delete(conn.conns, conn)
+		conn.connWg.Done()
 	}
 }
 
@@ -138,6 +170,11 @@ func commandWithShell(command string) []string {
 	}
 }
 
+func (conn *ServerConn) Exit(ch ssh.Channel) {
+	b := ssh.Marshal(struct{ ExitStatus uint32 }{conn.exitStatus})
+	ch.SendRequest("exit-status", false, b)
+}
+
 func (conn *ServerConn) HandleSessionChannel(wg *sync.WaitGroup, newChan ssh.NewChannel) {
 	// TODO: refactor this, too long
 	defer wg.Done()
@@ -146,22 +183,20 @@ func (conn *ServerConn) HandleSessionChannel(wg *sync.WaitGroup, newChan ssh.New
 		dbg.Debug("Unable to accept newChan: %v", err)
 		return
 	}
+
 	defer func() {
-		b := ssh.Marshal(struct{ ExitStatus uint32 }{conn.exitStatus})
-		ch.SendRequest("exit-status", false, b)
 		dbg.Debug("Closing session channel.")
 		ch.Close()
 	}()
 
-	var success bool
+	// TODO: close session by timeout
 	for req := range reqs {
+		var success bool
 		switch req.Type {
 		case "pty-req":
 			ptyreq := &PTYRequest{}
-			success = true
 			if err := ssh.Unmarshal(req.Payload, ptyreq); err != nil {
 				dbg.Debug("Error unmarshaling pty-req: %v", err)
-				success = false
 			}
 			conn.pty, err = pty.OpenPty()
 			if conn.pty != nil {
@@ -169,73 +204,101 @@ func (conn *ServerConn) HandleSessionChannel(wg *sync.WaitGroup, newChan ssh.New
 				os.Setenv("TERM", ptyreq.Term)
 				// TODO: set pty modes
 			}
-			if err != nil {
+			if err == nil {
+				success = true
+			} else {
 				dbg.Debug("Failed allocating pty: %v", err)
-				success = false
-			}
-			if req.WantReply {
-				req.Reply(success, []byte{})
 			}
 		case "env":
 			envreq := &EnvRequest{}
 			if err := ssh.Unmarshal(req.Payload, envreq); err != nil {
 				dbg.Debug("Error unmarshaling env: %v", err)
-				success = false
 			} else {
 				dbg.Debug("env: %s=%s", envreq.Name, envreq.Value)
 				conn.environ = append(conn.environ, fmt.Sprintf("%s=%s", envreq.Name, envreq.Value))
 				success = true
 			}
+		case "shell":
+			// TODO: get the user's shell
+			success = true
 			if req.WantReply {
 				req.Reply(success, []byte{})
 			}
-		case "shell":
-			// TODO: get the user's shell
 			conn.ExecuteForChannel(defaultShell(), ch)
-			if req.WantReply {
-				req.Reply(true, []byte{})
-			}
+			conn.Exit(ch)
 			return
 		case "exec":
 			execReq := &ExecRequest{}
 			if err := ssh.Unmarshal(req.Payload, execReq); err != nil {
+				if req.WantReply {
+					req.Reply(success, []byte{})
+				}
 				dbg.Debug("Error unmarshaling exec: %v", err)
-				success = false
 			} else {
 				if cmd, err := shlex.Split(execReq.Cmd); err == nil {
 					dbg.Debug("Command: %v", cmd)
-					if req.WantReply {
-						req.Reply(true, []byte{})
-					}
-					if cmd[0] == "scp" {
+					if len(cmd) == 0 {
+						// start a shell
+						success = true
+						if req.WantReply {
+							req.Reply(success, []byte{})
+						}
+						conn.ExecuteForChannel(defaultShell(), ch)
+						conn.Exit(ch)
+					} else if cmd[0] == "scp" {
+						if req.WantReply {
+							req.Reply(success, []byte{})
+						}
 						if err := conn.SCPHandler(cmd, ch); err != nil {
 							dbg.Debug("scp failure: %v", err)
 							conn.exitStatus = 1
+							conn.Exit(ch)
 						}
 					} else {
+						success = true
+						if req.WantReply {
+							req.Reply(success, []byte{})
+						}
 						conn.ExecuteForChannel(commandWithShell(execReq.Cmd), ch)
+						conn.Exit(ch)
 					}
 				} else {
 					dbg.Debug("Error splitting cmd: %v", err)
-					if req.WantReply {
-						req.Reply(false, []byte{})
-					}
 				}
+				return
 			}
-			return
+			if !success && req.WantReply {
+				req.Reply(success, []byte{})
+			}
 		default:
 			dbg.Debug("Unknown session request: %s", req.Type)
 			if req.WantReply {
-				req.Reply(false, []byte{})
+				req.Reply(success, []byte{})
 			}
 		}
+		conn.mu.Lock()
+		if conn.shutdown {
+			conn.mu.Unlock()
+			break
+		}
+		conn.mu.Unlock()
 	}
+}
+
+type exitStatusMsg struct {
+	Status uint32
 }
 
 // Execute a process for the channel.
 func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
+	if !conn.attachConn() {
+		conn.exitStatus = 127
+		dbg.Debug("Shutdown init, canceled executing %v", shellCmd)
+		return
+	}
 	dbg.Debug("Executing %v", shellCmd)
 	proc := exec.Command(shellCmd[0], shellCmd[1:]...)
+	proc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	proc.Env = conn.environ
 	if userInfo, err := user.Current(); err == nil {
 		proc.Dir = userInfo.HomeDir
@@ -249,8 +312,65 @@ func (conn *ServerConn) ExecuteForChannel(shellCmd []string, ch ssh.Channel) {
 		conn.pty.AttachPty(proc)
 		conn.pty.AttachIO(ch, ch)
 	}
-	proc.Run()
-	dbg.Debug("Finished execution.")
+
+	waitDone := make(chan struct{})
+	go func() {
+		select {
+		case <-conn.ctx.Done():
+			dbg.Debug("Killing session.")
+
+			switch runtime.GOOS {
+			case "windows":
+				proc.Process.Signal(syscall.SIGTERM)
+			default:
+				pgid, err := syscall.Getpgid(proc.Process.Pid)
+				if err == nil {
+					syscall.Kill(-pgid, 15) // kill process group with SIGTERM
+				} else {
+					proc.Process.Signal(syscall.SIGTERM)
+				}
+			}
+
+			select {
+			case <-time.After(time.Second):
+				proc.Process.Kill()
+			case <-waitDone:
+			}
+		case <-waitDone:
+		}
+	}()
+
+	err := proc.Run()
+	close(waitDone)
+	conn.detachConn()
+	if err == nil {
+		conn.exitStatus = 0
+		dbg.Debug("Finished execution.")
+	} else {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			ec := exitErr.ExitCode()
+			if ec == -1 {
+				if s, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+					if s.Signaled() {
+						ec = 128 + int(s.Signal())
+					}
+				}
+			}
+			conn.exitStatus = uint32(ec)
+		} else {
+			conn.exitStatus = 127
+		}
+		dbg.Debug("Finished execution with code %d, error: %v", conn.exitStatus, err)
+	}
+	b := ssh.Marshal(struct{ ExitStatus uint32 }{conn.exitStatus})
+	ch.SendRequest("exit-status", false, b)
+}
+
+func (conn *ServerConn) Cancel() {
+	if conn.cancel != nil {
+		conn.cancel()
+		conn.cancel = nil
+	}
 }
 
 // Message for port forwarding

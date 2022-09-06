@@ -13,19 +13,21 @@
 // limitations under the License.
 
 // TODO: High-level file comment.
-package main
+package sshdog
 
 import (
 	"bufio"
 	"errors"
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/msaf1980/sshdog/dbg"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -54,6 +56,7 @@ var (
 	ErrInvalidPieces  = errors.New("Invalid number of command pieces.")
 	ErrNotRegularFile = errors.New("Not a regular file.")
 	ErrNotDirectory   = errors.New("Not a directory.")
+	ErrNullByte       = errors.New("Expected null byte for EOF.")
 )
 
 // Manage SCP operations in a built-in fashion
@@ -289,7 +292,6 @@ func (conn *ServerConn) SCPSink(path string, dirMode bool, ch ssh.Channel) error
 		case SCPTime:
 		}
 	}
-	return nil
 }
 
 // receive the single file from the scp stream
@@ -325,7 +327,7 @@ func receiveFile(name string, cmd *SCPCommand, src io.Reader) error {
 		return err
 	}
 	if b[0] != byte(0) {
-		return fmt.Errorf("Expected null byte for EOF.")
+		return ErrNullByte
 	}
 	return nil
 }
@@ -339,7 +341,7 @@ func maybeMakeDir(path string, mode int16) error {
 		return nil
 	} else {
 		if !fi.IsDir() {
-			return fmt.Errorf("Path %s exists, but is not a directory.", path)
+			return errors.New("Path " + path + " exists, but is not a directory.")
 		}
 		return nil
 	}
