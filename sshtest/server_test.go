@@ -64,17 +64,19 @@ func TestServer_SessionCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clientDoneChan := make(chan struct{})
-	closeDoneChan := make(chan struct{})
+	clientDoneChan := make(chan struct{}, 1)
+	closeDoneChan := make(chan struct{}, 1)
 
 	var sessErr error
 	sess, _, cleanup := newClientSession(t, s.Address(), nil)
 	var stdout bytes.Buffer
 	sess.Stdout = &stdout
 	go func() {
-		defer cleanup()
-		defer close(clientDoneChan)
-		sessErr = sess.Run("sleep 10")
+		defer func() {
+			cleanup()
+			close(clientDoneChan)
+		}()
+		sessErr = sess.Run("sleep 60")
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -84,11 +86,21 @@ func TestServer_SessionCancel(t *testing.T) {
 		stop()
 	}()
 
-	timeout := time.After(2 * time.Second)
+	// timeout := time.After(4 * time.Second)
+	// select {
+	// case <-timeout:
+	// 	t.Error("timeout session cancel")
+	// 	<-clientDoneChan
+	// case <-clientDoneChan:
+	// }
+
+	<-clientDoneChan
+
+	timeout := time.After(10 * time.Second)
 	select {
 	case <-timeout:
-		t.Error("timeout")
-	case <-clientDoneChan:
+		t.Error("timeout shutdown")
+	case <-closeDoneChan:
 	}
 
 	if sessErr == nil {

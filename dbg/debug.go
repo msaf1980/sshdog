@@ -1,16 +1,14 @@
 package dbg
 
 import (
-	"fmt"
-	"os"
+	"log"
 )
 
 type Debugger bool
 
 func Debug(format string, args ...interface{}) {
 	if dbg {
-		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(os.Stderr, "[DEBUG] %s\n", msg)
+		log.Printf("[DEBUG] "+format, args...)
 	}
 }
 

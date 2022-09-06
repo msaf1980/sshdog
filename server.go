@@ -234,6 +234,7 @@ func (s *Server) Stop() {
 	s.mu.Unlock()
 	s.stop <- true
 	close(s.stop)
+	dbg.Debug("shutdown.")
 }
 
 func (s *Server) AddAuthorizedKeys(keyData []byte) *Server {
